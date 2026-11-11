@@ -2,6 +2,7 @@
 
 Claude Code と Codex のトークン消費を、Windows のタスクマネージャー（パフォーマンス）のように
 リアルタイムのグラフで見るためのローカルツールです。
+<img width="1555" height="1011" alt="ChatGPT 画像 2026年11月11日 15_39_18" src="https://github.com/user-attachments/assets/a7c84b3d-4adc-4f55-979a-1415b8e2fa42" />
 
 - 1秒ごとに更新され、グラフが右から左へ流れます
 - 上のボタンで **両方 / Claude / Codex** を切り替え
