@@ -32,7 +32,7 @@ REFRESH_SEC = 1.0
 lock = threading.Lock()
 offsets = {}        # path -> 読み済みバイト位置
 seen = {}           # (message.id, requestId) -> record（Claude のストリーミング重複の統合用）
-codex_files = {}    # path -> {"proj", "model", "last_total"}（Codex のファイルごとの状態）
+codex_files = {}    # path -> プロジェクト、モデル、重複防止などの Codex ファイルごとの状態
 # record: [ts, model, project, input, output, cache_create, cache_read, source]
 records = []
 state = {"ready": False, "scanned_files": 0, "last_scan": 0.0, "version": 0, "codex_limit": None}
@@ -142,9 +142,11 @@ def claude_lines(path, lines):
 # ---------------------------------------------------------------- Codex
 
 def codex_lines(path, lines):
-    st = codex_files.setdefault(path, {"proj": "(codex)", "model": "codex", "last_total": -1})
+    st = codex_files.setdefault(path, {"proj": "(codex)", "model": "codex", "last_total": -1,
+                                       "usage_records": False, "responses": set()})
     for line in lines:
-        if b'"token_count"' not in line and b'"turn_context"' not in line and b'"session_meta"' not in line:
+        if not any(tag in line for tag in (b'"token_count"', b'"token_usage_record"',
+                                           b'"turn_context"', b'"session_meta"')):
             continue
         try:
             d = json.loads(line)
@@ -160,6 +162,21 @@ def codex_lines(path, lines):
             if p.get("model"):
                 st["model"] = p["model"]
             continue
+        if t == "token_usage_record":
+            # 応答ごとの実使用量を優先する。圧縮時には token_count の使用量が
+            # ゼロになることもある。以降の token_count は上限表示だけに使う。
+            usage = p.get("usage")
+            ts = parse_ts(d.get("timestamp") or "")
+            if not isinstance(usage, dict) or ts is None:
+                continue
+            st["usage_records"] = True
+            response = p.get("response_id")
+            if response:
+                if response in st["responses"]:
+                    continue
+                st["responses"].add(response)
+            append_codex_usage(st, ts, usage)
+            continue
         if t != "event_msg" or p.get("type") != "token_count":
             continue
         ts = parse_ts(d.get("timestamp") or "")
@@ -174,23 +191,30 @@ def codex_lines(path, lines):
                 state["codex_limit"] = {"ts": ts, "used": prim.get("used_percent"),
                                         "window_min": prim.get("window_minutes"),
                                         "resets_at": prim.get("resets_at")}
-        # トークン数（累計が増えたときだけ、そのリクエスト分を加算）
+        if st["usage_records"]:
+            continue
+        # 旧形式のログ: 同じ累計の再通知だけを除外する。再開や圧縮で
+        # 累計が減ることがあるため、過去の最大値との比較はしない。
         info = p.get("info")
         if not isinstance(info, dict):
             continue
         tot = (info.get("total_token_usage") or {}).get("total_tokens")
         last = info.get("last_token_usage") or {}
-        if tot is None or tot <= st["last_total"]:
+        if tot is None or tot == st["last_total"]:
             continue
         st["last_total"] = tot
-        inp = last.get("input_tokens") or 0           # Codex は入力にキャッシュ分を含む
-        cached = last.get("cached_input_tokens") or 0
-        out = last.get("output_tokens") or 0           # 推論トークンを含む
-        cw = last.get("cache_write_input_tokens") or 0
-        r = [ts, st["model"], st["proj"], max(0, inp - cached), out, cw, cached, "codex"]
-        if r[3] or r[4] or r[5] or r[6]:
-            records.append(r)
-            state["version"] += 1
+        append_codex_usage(st, ts, last)
+
+
+def append_codex_usage(st, ts, usage):
+    inp = usage.get("input_tokens") or 0           # Codex は入力にキャッシュ分を含む
+    cached = usage.get("cached_input_tokens") or 0
+    out = usage.get("output_tokens") or 0         # 推論トークンを含む
+    cw = usage.get("cache_write_input_tokens") or 0
+    r = [ts, st["model"], st["proj"], max(0, inp - cached), out, cw, cached, "codex"]
+    if r[3] or r[4] or r[5] or r[6]:
+        records.append(r)
+        state["version"] += 1
 
 
 # ---------------------------------------------------------------- 走査
